@@ -8,20 +8,27 @@ import sounddevice as sd
 import win32pipe, win32file, pywintypes
 
 # ====================== CONFIG ======================
-RTMP_URL = "rtmp://51.79.231.72:1935/xstream/test-siam-1"  # <-- เปลี่ยนปลายทางของคุณ
-FFMPEG   = r"ffmpeg"                                 # หรือพาธเต็ม เช่น r"C:\ffmpeg\bin\ffmpeg.exe"
+RTMP_URL = "rtmp://51.79.231.72:1935/xstream/test-siam-1"
+FFMPEG   = r"ffmpeg"  # ถ้า ffmpeg ไม่อยู่ใน PATH ให้ใส่พาธเต็ม เช่น r"C:\ffmpeg\bin\ffmpeg.exe"
 
 # วิดีโอ: index ของ capture 4 ช่อง (DirectShow) เรียง [ซ้ายบน,ขวาบน,ซ้ายล่าง,ขวาล่าง]
 DEVICE_INDEXES = [0, 1, 2, 3]
 
-# เสียง: index ของ input device ตามลำดับเดียวกับภาพ (ต้องครบ 4 ค่า)
-AUDIO_DEVICE_INDEXES = [4, 7, 11, 14]  # <-- แก้ให้ตรงเครื่องคุณ
+# จับคู่ "ชื่ออุปกรณ์เสียง" ตามลำดับเดียวกับภาพ (จะ resolve เป็น index อัตโนมัติด้านล่าง)
+AUDIO_DEVICE_NAMES = [
+    "HDPro Audio 1 (HWSPro Capture Card)",
+    "HDPro Audio 2 (HWSPro Capture Card)",
+    "HDPro Audio 3 (HWSPro Capture Card)",
+    "HDPro Audio 4 (HWSPro Capture Card)",
+]
+# ถ้าอยากล็อกเป็นตัวเลขเอง ให้ตั้ง AUDIO_DEVICE_INDEXES = [..,..,..,..] แล้วไม่ต้องใช้ชื่อ
+AUDIO_DEVICE_INDEXES: Optional[List[int]] = None  # จะถูกเติมจากชื่ออัตโนมัติ
 
 # ขนาด/เฟรมเรต
 WIDTH, HEIGHT = 1920, 1080
 FPS   = 30
 BITRATE      = "2000k"
-X264_PRESET  = "slow"
+X264_PRESET  = "veryfast"
 GOP_SECONDS  = 2
 
 # สลับและตรวจ motion
@@ -127,7 +134,7 @@ def make_preview_grid(frames: List[np.ndarray], active_idx: int) -> np.ndarray:
     pos_map = {0:(0,0), 1:(0,w), 2:(h,0), 3:(h,w)}
     y, x = pos_map.get(active_idx, (0,0))
     cv2.rectangle(grid, (x, y), (x+w, y+h), (0,255,0), BORDER_THICK)
-    label = f"ACTIVE #{active_idx}  V:{DEVICE_INDEXES[active_idx]}  A:{AUDIO_DEVICE_INDEXES[active_idx]}"
+    label = f"ACTIVE #{active_idx}"
     cv2.putText(grid, label, (x+18, y+40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2, cv2.LINE_AA)
     return grid
 
@@ -153,7 +160,7 @@ def wait_client_connect(handle, deadline_sec=20, tag=""):
             print(f"{tag} pipe connected.")
             return True
         except pywintypes.error as e:
-            if e.winerror == 535:  # ERROR_PIPE_CONNECTED: client ต่อมาแล้ว
+            if e.winerror == 535:  # ERROR_PIPE_CONNECTED
                 print(f"{tag} pipe already connected.")
                 return True
         time.sleep(0.1)
@@ -197,14 +204,48 @@ def ffmpeg_log_printer(proc: subprocess.Popen):
         pass
 
 
-# ---------------------- Audio I/O ---------------------
+# ----------------- Resolve audio names → indexes ------
+def resolve_audio_indices_by_name(names: List[str]) -> List[int]:
+    """
+    รับรายชื่อ audio devices แล้วคืน list ของ index (จาก sounddevice.query_devices())
+    ถ้าไม่พบชื่อไหน จะพยายาม match แบบ contains; ถ้ายังไม่เจอให้ raise เพื่อให้ผู้ใช้แก้ชื่อ
+    """
+    devs = sd.query_devices()
+    idxs = []
+    for want in names:
+        want_low = want.lower()
+        match = None
+        # exact match ก่อน
+        for i, d in enumerate(devs):
+            if d.get("max_input_channels", 0) > 0 and d["name"].lower() == want_low:
+                match = i
+                break
+        # ถ้า exact ไม่เจอ ลองแบบ contains (ทุกคำ)
+        if match is None:
+            parts = [p for p in want.split() if p]
+            for i, d in enumerate(devs):
+                if d.get("max_input_channels", 0) > 0:
+                    nm = d["name"].lower()
+                    if all(p.lower() in nm for p in parts):
+                        match = i
+                        break
+        if match is None:
+            raise RuntimeError(
+                f"ไม่พบอุปกรณ์เสียง: {want}\n"
+                "ตรวจด้วย: python -c \"import sounddevice as sd; print([ (i,d['name']) for i,d in enumerate(sd.query_devices()) if d.get('max_input_channels',0)>0 ])\""
+            )
+        idxs.append(match)
+    return idxs
+
+
+# ---------------------- Audio Writer ------------------
 class AudioPipeWriter(threading.Thread):
     """
     เขียนเสียงลง audio pipe ตลอดเวลา:
-    - เริ่มจาก 'silence mode' เพื่อให้สตรีมเปิดได้ทันที
-    - พยายามเชื่อมต่ออุปกรณ์เสียงจริงภายใน 10 วิ (และ retry เป็นระยะ)
-    - เมื่อพร้อม -> crossfade เปลี่ยนจาก silence -> real audio
-    - เวลาเปลี่ยน source -> crossfade ไปอุปกรณ์ใหม่
+    - เริ่มด้วย silence (ให้ ffmpeg ต่อทันที)
+    - พยายาม start อุปกรณ์จริงภายใน 10 วิ, ถ้าไม่สำเร็จ retry ทุก 2 วิ
+    - เมื่อพร้อม → crossfade เป็นเสียงจริง
+    - เวลาเปลี่ยน source → crossfade ไปอุปกรณ์ใหม่
     """
     def __init__(self, pipe_handle):
         super().__init__(daemon=True)
@@ -213,14 +254,13 @@ class AudioPipeWriter(threading.Thread):
         self.current_dev: Optional[int] = None
         self.lock = threading.Lock()
         self.running = True
-        self.requested_dev: Optional[int] = None  # dev ที่อยากใช้ (ตาม source ปัจจุบัน)
+        self.requested_dev: Optional[int] = None
         self.first_try_deadline = 0.0
-        self.silence_mode = True  # เริ่มด้วยเงียบ
+        self.silence_mode = True
 
     def set_target_device(self, dev_index: int):
         with self.lock:
             self.requested_dev = dev_index
-            # หากยังไม่มี stream เลย ให้เริ่มจับเวลา 10 วิ สำหรับ first-try
             if self.stream is None and self.first_try_deadline == 0.0:
                 self.first_try_deadline = time.time() + AUDIO_TRY_TIMEOUT_SEC
 
@@ -233,7 +273,7 @@ class AudioPipeWriter(threading.Thread):
             self.stream = st
             self.current_dev = dev_index
             return True
-        except Exception as e:
+        except Exception:
             return False
 
     def _stop_stream(self):
@@ -260,8 +300,8 @@ class AudioPipeWriter(threading.Thread):
             self._write_silence()
 
     def _crossfade_switch(self, new_dev: int):
-        # fade-out
         steps = max(2, int((AUDIO_FADE_MS/1000.0) * (AUDIO_SR / AUDIO_BLOCK)))
+        # fade-out
         for s in range(steps):
             scale = 1.0 - (s+1)/steps
             if self.stream is None:
@@ -273,8 +313,7 @@ class AudioPipeWriter(threading.Thread):
                     pipe_write(self.pipe, block.tobytes())
                 except sd.PortAudioError:
                     self._write_silence()
-
-        # switch device
+        # switch
         self._stop_stream()
         if self._start_stream(new_dev):
             self.silence_mode = False
@@ -288,28 +327,22 @@ class AudioPipeWriter(threading.Thread):
                 except sd.PortAudioError:
                     self._write_silence()
         else:
-            # start new failed -> keep silence and retry later
             self.silence_mode = True
 
     def run(self):
         next_retry = 0.0
         while self.running:
-            # 1) ถ้ายังไม่มี stream (เริ่มต้น) → พยายามเริ่มภายใน 10 วิแรก
             with self.lock:
                 target = self.requested_dev
-
             now = time.time()
             if self.stream is None:
-                # ใส่เสียงเงียบไปเรื่อยๆ เพื่อให้ ffmpeg ได้ audio ต่อเนื่อง
+                # เขียน silence ไปเรื่อยๆ ให้ ffmpeg ไม่รอ
                 self._write_silence()
-
                 if target is not None:
-                    # ภายใน timeout แรกให้พยายามเรื่อยๆ (spam-retry)
                     if self.first_try_deadline != 0.0 and now <= self.first_try_deadline:
                         if self._start_stream(target):
                             self.silence_mode = False
-                            continue  # next loop จะอ่านจาก stream
-                    # หมด 10 วิแล้ว → ตั้ง retry เป็นช่วงๆ
+                            continue
                     if now >= self.first_try_deadline and now >= next_retry:
                         if self._start_stream(target):
                             self.silence_mode = False
@@ -317,13 +350,9 @@ class AudioPipeWriter(threading.Thread):
                             self.silence_mode = True
                             next_retry = now + AUDIO_RETRY_INTERVAL_SEC
             else:
-                # 2) มี stream แล้ว → ถ้า target เปลี่ยน (เปลี่ยน source) ให้ crossfade ไปอุปกรณ์ใหม่
                 if target is not None and target != self.current_dev:
                     self._crossfade_switch(target)
-                # เขียนบล็อกเสียงจาก stream
                 self._write_from_stream()
-
-        # cleanup
         self._stop_stream()
 
     def stop(self):
@@ -332,6 +361,12 @@ class AudioPipeWriter(threading.Thread):
 
 # -------------------------- MAIN ---------------------
 def main():
+    # ถ้าอยากล็อกเป็นเลข index เอง ให้ตั้ง AUDIO_DEVICE_INDEXES = [..,..,..,..] ด้านบน
+    global AUDIO_DEVICE_INDEXES
+    if AUDIO_DEVICE_INDEXES is None:
+        AUDIO_DEVICE_INDEXES = resolve_audio_indices_by_name(AUDIO_DEVICE_NAMES)
+    print("AUDIO_DEVICE_INDEXES resolved =", AUDIO_DEVICE_INDEXES)
+
     print(f"Using FFMPEG: {FFMPEG}")
 
     # 1) ตั้ง readers วิดีโอ (4 แหล่ง)
@@ -346,10 +381,9 @@ def main():
     # 3) สตาร์ต ffmpeg
     ff = launch_ffmpeg_with_existing_pipes()
     threading.Thread(target=ffmpeg_log_printer, args=(ff,), daemon=True).start()
-
     print("Launched ffmpeg, waiting it to connect pipes...")
 
-    # 4) รอ ffmpeg connect ทั้ง 2 ท่อ (ภาพ/เสียง)
+    # 4) รอ ffmpeg connect ทั้ง 2 ท่อ
     ok_v = wait_client_connect(vid_handle, deadline_sec=20, tag="Video")
     ok_a = wait_client_connect(aud_handle, deadline_sec=20, tag="Audio")
     if not (ok_v and ok_a):
@@ -412,7 +446,6 @@ def main():
                 elif k in (ord('1'), ord('2'), ord('3'), ord('4')):
                     new_active = int(chr(k)) - 1
                     if new_active != active:
-                        # สลับอุปกรณ์เสียงให้ตรงกับภาพใหม่ (audio_writer จะ crossfade เอง)
                         try:
                             audio_writer.set_target_device(AUDIO_DEVICE_INDEXES[new_active])
                         except IndexError:
@@ -436,7 +469,7 @@ def main():
                             print("AUDIO_DEVICE_INDEXES ไม่ครบ 4 ตัว — คงเสียงเดิม")
                         active = probe
                         last_switch = time.time()
-                        print(f"Switched → VIDEO dev#{DEVICE_INDEXES[active]} + AUDIO dev#{AUDIO_DEVICE_INDEXES[active]}")
+                        print(f"Switched → VIDEO dev#{DEVICE_INDEXES[active]} + AUDIO (mapped)")
                         switched = True
                         break
                 if not switched:
@@ -445,12 +478,11 @@ def main():
 
             # pace video
             elapsed = time.time() - t0
-            sleep_dur = out_frame_interval - elapsed
+            sleep_dur = (1.0 / FPS) - elapsed
             if sleep_dur > 0:
                 time.sleep(sleep_dur)
 
     finally:
-        # cleanup
         try: audio_writer.stop()
         except Exception: pass
         try:
