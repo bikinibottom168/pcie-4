@@ -1,4 +1,4 @@
-import time, threading, subprocess, sys, os
+import time, threading, subprocess, sys
 from typing import List, Tuple, Optional
 import numpy as np
 import cv2
@@ -8,41 +8,41 @@ import sounddevice as sd
 import win32pipe, win32file, pywintypes
 
 # ====================== CONFIG ======================
-# --- เปลี่ยนค่าตามระบบคุณ ---
 RTMP_URL = "rtmp://51.79.231.72:1935/xstream/test-siam-1"  # <-- เปลี่ยนปลายทางของคุณ
-FFMPEG   = r"ffmpeg"                                 # หรือระบุ path เต็ม เช่น r"C:\ffmpeg\bin\ffmpeg.exe"
+FFMPEG   = r"ffmpeg"                                 # หรือพาธเต็ม เช่น r"C:\ffmpeg\bin\ffmpeg.exe"
 
-# วิดีโอ: ดัชนีอุปกรณ์ (DirectShow) ของ capture 4 ช่อง (เรียงซ้ายบน,ขวาบน,ซ้ายล่าง,ขวาล่าง)
+# วิดีโอ: index ของ capture 4 ช่อง (DirectShow) เรียง [ซ้ายบน,ขวาบน,ซ้ายล่าง,ขวาล่าง]
 DEVICE_INDEXES = [0, 1, 2, 3]
 
-# เสียง: จับคู่ “ตามลำดับเดียวกับภาพ”
-#   เช่น ภาพ dev 0 → เสียง index 4, ภาพ dev 1 → เสียง index 7, ...
+# เสียง: index ของ input device ตามลำดับเดียวกับภาพ (ต้องครบ 4 ค่า)
 AUDIO_DEVICE_INDEXES = [4, 7, 11, 14]  # <-- แก้ให้ตรงเครื่องคุณ
 
-# ขนาด/เฟรมเรต (ให้ทุกช่องเท่ากัน)
-WIDTH, HEIGHT = 1280, 720
-FPS = 30
-BITRATE = "3500k"
-X264_PRESET = "veryfast"
-GOP_SECONDS = 2
+# ขนาด/เฟรมเรต
+WIDTH, HEIGHT = 1920, 1080
+FPS   = 30
+BITRATE      = "2000k"
+X264_PRESET  = "slow"
+GOP_SECONDS  = 2
 
 # สลับและตรวจ motion
-SWITCH_SECONDS = 120
-MOTION_CHECK_FRAMES = 3
+SWITCH_SECONDS        = 120
+MOTION_CHECK_FRAMES   = 3
 MOTION_CHECK_INTERVAL = 0.4
-DIFF_THRESHOLD = 2.0        # % diff >= นี้ = มีการเคลื่อนไหว
-MIN_BRIGHTNESS = 5.0        # % สว่างเฉลี่ยขั้นต่ำ
+DIFF_THRESHOLD        = 2.0   # % diff >= นี้ = มีการเคลื่อนไหว
+MIN_BRIGHTNESS        = 5.0   # % สว่างเฉลี่ยขั้นต่ำ
 
 # พรีวิว
-WINDOW_NAME = "Preview (2x2) — green = ACTIVE"
-PREVIEW_FPS = 15
-BORDER_THICK = 6
+WINDOW_NAME   = "Preview (2x2) — green = ACTIVE"
+PREVIEW_FPS   = 15
+BORDER_THICK  = 6
 
 # เสียง
-AUDIO_SR = 48000
-AUDIO_CH = 2
-AUDIO_BLOCK = 1024           # samples/CH ต่อครั้ง (ลดเพื่อลดดีเลย์)
-AUDIO_FADE_MS = 120          # cross-fade ตอนสลับเสียง
+AUDIO_SR      = 48000
+AUDIO_CH      = 2
+AUDIO_BLOCK   = 1024     # samples/CH per write
+AUDIO_FADE_MS = 120      # crossfade ตอนสลับอุปกรณ์
+AUDIO_TRY_TIMEOUT_SEC = 10   # พยายามต่ออุปกรณ์ครั้งแรกภายใน 10 วิ
+AUDIO_RETRY_INTERVAL_SEC = 2 # ถ้าไม่สำเร็จ จะลองใหม่ทุก 2 วิ
 # ====================================================
 
 
@@ -64,7 +64,7 @@ def brightness_percent(a: np.ndarray) -> float:
 
 # ----------------- Video Capture Reader --------------
 class CaptureReader(threading.Thread):
-    """อ่านเฟรมของแต่ละอุปกรณ์เก็บไว้เป็นเฟรมล่าสุด (เปิดพร้อมกันทั้ง 4 ช่อง)"""
+    """อ่านเฟรมของแต่ละอุปกรณ์เก็บเป็นเฟรมล่าสุด (เปิดพร้อมกันทั้ง 4 ช่อง)"""
     def __init__(self, device_index: int, w: int, h: int, fps: int):
         super().__init__(daemon=True)
         self.idx = device_index
@@ -78,7 +78,7 @@ class CaptureReader(threading.Thread):
         self.running = True
 
     def run(self):
-        interval = 1.0 / max(5, min(self.fps, 30))  # จำกัดอัตราอ่าน
+        interval = 1.0 / max(5, min(self.fps, 30))
         while self.running:
             ok, frame = self.cap.read()
             if ok and frame is not None:
@@ -98,10 +98,8 @@ class CaptureReader(threading.Thread):
 
     def close(self):
         self.running = False
-        try:
-            self.cap.release()
-        except Exception:
-            pass
+        try: self.cap.release()
+        except Exception: pass
 
 
 def check_motion_from_reader(reader: CaptureReader) -> Tuple[bool, float, float]:
@@ -118,7 +116,7 @@ def check_motion_from_reader(reader: CaptureReader) -> Tuple[bool, float, float]
 
 
 def make_preview_grid(frames: List[np.ndarray], active_idx: int) -> np.ndarray:
-    """รวม 4 เฟรมเป็น 2x2 และตีกรอบเขียวที่ active (ลำดับ [0,1; 2,3])"""
+    """รวม 4 เฟรมเป็น 2x2 และตีกรอบเขียวแหล่งที่ active (ลำดับ [0,1; 2,3])"""
     assert len(frames) == 4
     h, w = frames[0].shape[:2]
     grid = np.zeros((h*2, w*2, 3), dtype=np.uint8)
@@ -129,14 +127,14 @@ def make_preview_grid(frames: List[np.ndarray], active_idx: int) -> np.ndarray:
     pos_map = {0:(0,0), 1:(0,w), 2:(h,0), 3:(h,w)}
     y, x = pos_map.get(active_idx, (0,0))
     cv2.rectangle(grid, (x, y), (x+w, y+h), (0,255,0), BORDER_THICK)
-    cv2.putText(grid, f"ACTIVE #{active_idx}  V:{DEVICE_INDEXES[active_idx]}  A:{AUDIO_DEVICE_INDEXES[active_idx]}",
-                (x+18, y+40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2, cv2.LINE_AA)
+    label = f"ACTIVE #{active_idx}  V:{DEVICE_INDEXES[active_idx]}  A:{AUDIO_DEVICE_INDEXES[active_idx]}"
+    cv2.putText(grid, label, (x+18, y+40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2, cv2.LINE_AA)
     return grid
 
 
 # ----------------- Named Pipes (Windows) --------------
 def create_listening_pipe(name: str):
-    """สร้างท่อ (ยังไม่ Connect) — Python จะเป็นฝั่งเขียนออก (OUTBOUND)"""
+    """สร้างท่อ (ยังไม่ Connect) — Python เป็นฝั่งเขียน (OUTBOUND)"""
     full = r"\\.\pipe\{}".format(name)
     handle = win32pipe.CreateNamedPipe(
         full,
@@ -146,13 +144,21 @@ def create_listening_pipe(name: str):
     )
     return handle
 
-def wait_client_connect(handle):
-    try:
-        win32pipe.ConnectNamedPipe(handle, None)
-    except pywintypes.error as e:
-        # ถ้าลูกค้าต่อมาก่อนแล้ว จะได้ ERROR_PIPE_CONNECTED (535) → ถือว่าโอเค
-        if e.winerror != 535:
-            raise
+def wait_client_connect(handle, deadline_sec=20, tag=""):
+    """รอ client (ffmpeg) connect พร้อม timeout"""
+    end = time.time() + deadline_sec
+    while time.time() < end:
+        try:
+            win32pipe.ConnectNamedPipe(handle, None)
+            print(f"{tag} pipe connected.")
+            return True
+        except pywintypes.error as e:
+            if e.winerror == 535:  # ERROR_PIPE_CONNECTED: client ต่อมาแล้ว
+                print(f"{tag} pipe already connected.")
+                return True
+        time.sleep(0.1)
+    print(f"Timeout waiting for {tag} pipe.")
+    return False
 
 def pipe_write(handle, data: bytes):
     win32file.WriteFile(handle, data)
@@ -160,16 +166,12 @@ def pipe_write(handle, data: bytes):
 
 # ------------------ FFmpeg launcher -------------------
 def launch_ffmpeg_with_existing_pipes():
-    """
-    ffmpeg จะอ่านจาก named pipes ที่มีอยู่แล้ว:
-      - \\.\pipe\video_pipe : rawvideo (bgr24, WxH@FPS)
-      - \\.\pipe\audio_pipe : s16le stereo @ 48k
-    """
+    """ffmpeg อ่านจาก named pipes ที่ Python สร้างไว้แล้ว"""
     video_pipe = r"\\.\pipe\video_pipe"
     audio_pipe = r"\\.\pipe\audio_pipe"
     cmd = [
         FFMPEG,
-        "-hide_banner", "-loglevel", "info",  # เปิด log เพื่อ debug
+        "-hide_banner", "-loglevel", "info",
         # video
         "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{WIDTH}x{HEIGHT}", "-r", str(FPS), "-i", video_pipe,
@@ -182,15 +184,11 @@ def launch_ffmpeg_with_existing_pipes():
         "-b:v", BITRATE, "-maxrate", BITRATE, "-bufsize", BITRATE,
         "-g", str(FPS * GOP_SECONDS), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-ar", str(AUDIO_SR),
-        # output
         "-f", "flv", RTMP_URL
     ]
-    # เก็บ stderr ไว้แสดงเป็น log
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
 
-
 def ffmpeg_log_printer(proc: subprocess.Popen):
-    """อ่าน stderr ของ ffmpeg แล้วพิมพ์ให้ดู (background thread)"""
     try:
         if proc.stderr:
             for line in proc.stderr:
@@ -200,22 +198,45 @@ def ffmpeg_log_printer(proc: subprocess.Popen):
 
 
 # ---------------------- Audio I/O ---------------------
-class AudioIO:
-    """อ่านเสียงจาก input (sounddevice) → เขียนลง audio named pipe พร้อม crossfade ตอนสลับ"""
+class AudioPipeWriter(threading.Thread):
+    """
+    เขียนเสียงลง audio pipe ตลอดเวลา:
+    - เริ่มจาก 'silence mode' เพื่อให้สตรีมเปิดได้ทันที
+    - พยายามเชื่อมต่ออุปกรณ์เสียงจริงภายใน 10 วิ (และ retry เป็นระยะ)
+    - เมื่อพร้อม -> crossfade เปลี่ยนจาก silence -> real audio
+    - เวลาเปลี่ยน source -> crossfade ไปอุปกรณ์ใหม่
+    """
     def __init__(self, pipe_handle):
+        super().__init__(daemon=True)
         self.pipe = pipe_handle
         self.stream: Optional[sd.InputStream] = None
         self.current_dev: Optional[int] = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.requested_dev: Optional[int] = None  # dev ที่อยากใช้ (ตาม source ปัจจุบัน)
+        self.first_try_deadline = 0.0
+        self.silence_mode = True  # เริ่มด้วยเงียบ
 
-    def start_with_device(self, dev_index: int):
-        self.stop()
-        self.stream = sd.InputStream(device=dev_index, samplerate=AUDIO_SR,
-                                     channels=AUDIO_CH, dtype='int16',
-                                     blocksize=AUDIO_BLOCK)
-        self.stream.start()
-        self.current_dev = dev_index
+    def set_target_device(self, dev_index: int):
+        with self.lock:
+            self.requested_dev = dev_index
+            # หากยังไม่มี stream เลย ให้เริ่มจับเวลา 10 วิ สำหรับ first-try
+            if self.stream is None and self.first_try_deadline == 0.0:
+                self.first_try_deadline = time.time() + AUDIO_TRY_TIMEOUT_SEC
 
-    def stop(self):
+    def _start_stream(self, dev_index: int) -> bool:
+        try:
+            st = sd.InputStream(device=dev_index, samplerate=AUDIO_SR,
+                                channels=AUDIO_CH, dtype='int16',
+                                blocksize=AUDIO_BLOCK)
+            st.start()
+            self.stream = st
+            self.current_dev = dev_index
+            return True
+        except Exception as e:
+            return False
+
+    def _stop_stream(self):
         if self.stream is not None:
             try: self.stream.stop()
             except Exception: pass
@@ -224,103 +245,117 @@ class AudioIO:
             self.stream = None
             self.current_dev = None
 
-    def write_once(self):
-        """อ่านหนึ่งบล็อกจาก input ปัจจุบัน (หรือ silence) แล้วเขียนลง pipe"""
+    def _write_silence(self):
+        silence = (np.zeros((AUDIO_BLOCK, AUDIO_CH), dtype=np.int16)).tobytes()
+        pipe_write(self.pipe, silence)
+
+    def _write_from_stream(self):
         if self.stream is None:
-            silence = (np.zeros((AUDIO_BLOCK, AUDIO_CH), dtype=np.int16)).tobytes()
-            pipe_write(self.pipe, silence)
+            self._write_silence()
             return
         try:
             block, _ = self.stream.read(AUDIO_BLOCK)
             pipe_write(self.pipe, block.tobytes())
         except sd.PortAudioError:
-            silence = (np.zeros((AUDIO_BLOCK, AUDIO_CH), dtype=np.int16)).tobytes()
-            pipe_write(self.pipe, silence)
+            self._write_silence()
 
-    def crossfade_to_device(self, new_dev_index: int, fade_ms: int = AUDIO_FADE_MS):
-        """fade-out → switch → fade-in เพื่อลดเสียงป๊อปตอนสลับแหล่ง"""
-        steps = max(2, int((fade_ms/1000.0) * (AUDIO_SR / AUDIO_BLOCK)))
-
+    def _crossfade_switch(self, new_dev: int):
         # fade-out
+        steps = max(2, int((AUDIO_FADE_MS/1000.0) * (AUDIO_SR / AUDIO_BLOCK)))
         for s in range(steps):
             scale = 1.0 - (s+1)/steps
             if self.stream is None:
-                silence = (np.zeros((AUDIO_BLOCK, AUDIO_CH), dtype=np.int16)).tobytes()
-                pipe_write(self.pipe, silence)
+                self._write_silence()
             else:
                 try:
                     block, _ = self.stream.read(AUDIO_BLOCK)
                     block = (block.astype(np.int32) * scale).astype(np.int16)
                     pipe_write(self.pipe, block.tobytes())
                 except sd.PortAudioError:
-                    silence = (np.zeros((AUDIO_BLOCK, AUDIO_CH), dtype=np.int16)).tobytes()
-                    pipe_write(self.pipe, silence)
+                    self._write_silence()
 
-        # switch
-        self.start_with_device(new_dev_index)
+        # switch device
+        self._stop_stream()
+        if self._start_stream(new_dev):
+            self.silence_mode = False
+            # fade-in
+            for s in range(steps):
+                scale = (s+1)/steps
+                try:
+                    block, _ = self.stream.read(AUDIO_BLOCK)
+                    block = (block.astype(np.int32) * scale).astype(np.int16)
+                    pipe_write(self.pipe, block.tobytes())
+                except sd.PortAudioError:
+                    self._write_silence()
+        else:
+            # start new failed -> keep silence and retry later
+            self.silence_mode = True
 
-        # fade-in
-        for s in range(steps):
-            scale = (s+1)/steps
-            try:
-                block, _ = self.stream.read(AUDIO_BLOCK)
-                block = (block.astype(np.int32) * scale).astype(np.int16)
-                pipe_write(self.pipe, block.tobytes())
-            except sd.PortAudioError:
-                silence = (np.zeros((AUDIO_BLOCK, AUDIO_CH), dtype=np.int16)).tobytes()
-                pipe_write(self.pipe, silence)
+    def run(self):
+        next_retry = 0.0
+        while self.running:
+            # 1) ถ้ายังไม่มี stream (เริ่มต้น) → พยายามเริ่มภายใน 10 วิแรก
+            with self.lock:
+                target = self.requested_dev
+
+            now = time.time()
+            if self.stream is None:
+                # ใส่เสียงเงียบไปเรื่อยๆ เพื่อให้ ffmpeg ได้ audio ต่อเนื่อง
+                self._write_silence()
+
+                if target is not None:
+                    # ภายใน timeout แรกให้พยายามเรื่อยๆ (spam-retry)
+                    if self.first_try_deadline != 0.0 and now <= self.first_try_deadline:
+                        if self._start_stream(target):
+                            self.silence_mode = False
+                            continue  # next loop จะอ่านจาก stream
+                    # หมด 10 วิแล้ว → ตั้ง retry เป็นช่วงๆ
+                    if now >= self.first_try_deadline and now >= next_retry:
+                        if self._start_stream(target):
+                            self.silence_mode = False
+                        else:
+                            self.silence_mode = True
+                            next_retry = now + AUDIO_RETRY_INTERVAL_SEC
+            else:
+                # 2) มี stream แล้ว → ถ้า target เปลี่ยน (เปลี่ยน source) ให้ crossfade ไปอุปกรณ์ใหม่
+                if target is not None and target != self.current_dev:
+                    self._crossfade_switch(target)
+                # เขียนบล็อกเสียงจาก stream
+                self._write_from_stream()
+
+        # cleanup
+        self._stop_stream()
+
+    def stop(self):
+        self.running = False
 
 
 # -------------------------- MAIN ---------------------
 def main():
-    # 0) ตรวจ ffmpeg
-    #   ถ้า ffmpeg ไม่อยู่ใน PATH ให้แก้ตัวแปร FFMPEG เป็นพาธเต็ม
-    #   ตัวนี้ไม่ hard-fail แค่เตือน (ffmpeg จะ error เองถ้าไม่พบ)
     print(f"Using FFMPEG: {FFMPEG}")
 
     # 1) ตั้ง readers วิดีโอ (4 แหล่ง)
     readers = [CaptureReader(idx, WIDTH, HEIGHT, FPS) for idx in DEVICE_INDEXES]
-    for r in readers:
-        r.start()
+    for r in readers: r.start()
     time.sleep(1.0)  # รอให้มีเฟรม
 
-    # 2) สร้างท่อรอไว้ก่อน (Python = server)
+    # 2) สร้างท่อรอไว้ก่อน
     vid_handle = create_listening_pipe("video_pipe")
     aud_handle = create_listening_pipe("audio_pipe")
 
-    # 3) สตาร์ต ffmpeg ที่จะเปิด \\.\pipe\video_pipe และ \\.\pipe\audio_pipe
+    # 3) สตาร์ต ffmpeg
     ff = launch_ffmpeg_with_existing_pipes()
-    t = threading.Thread(target=ffmpeg_log_printer, args=(ff,), daemon=True)
-    t.start()
+    threading.Thread(target=ffmpeg_log_printer, args=(ff,), daemon=True).start()
 
-    print("Launched ffmpeg, waiting for it to connect named pipes...")
+    print("Launched ffmpeg, waiting it to connect pipes...")
 
-    # 4) รอ ffmpeg connect (มี timeout)
-    deadline = time.time() + 20  # 20 วินาที
-    connected_video = False
-    connected_audio = False
-    while time.time() < deadline and (not connected_video or not connected_audio):
-        if not connected_video:
-            try:
-                wait_client_connect(vid_handle)
-                connected_video = True
-                print("Video pipe connected.")
-            except Exception:
-                pass
-        if not connected_audio:
-            try:
-                wait_client_connect(aud_handle)
-                connected_audio = True
-                print("Audio pipe connected.")
-            except Exception:
-                pass
-        time.sleep(0.1)
-
-    if not (connected_video and connected_audio):
-        print("ERROR: Failed to connect pipes in time. Check ffmpeg path/permissions/args.")
+    # 4) รอ ffmpeg connect ทั้ง 2 ท่อ (ภาพ/เสียง)
+    ok_v = wait_client_connect(vid_handle, deadline_sec=20, tag="Video")
+    ok_a = wait_client_connect(aud_handle, deadline_sec=20, tag="Audio")
+    if not (ok_v and ok_a):
+        print("ERROR: Pipe connection failed. Check ffmpeg path/permissions/args.")
         try:
             if ff.stderr:
-                # อ่านส่วนแรกของ log ให้ดู
                 err = ff.stderr.read(3000)
                 print("FFmpeg stderr (first 3KB):\n", err)
         except Exception:
@@ -334,24 +369,23 @@ def main():
     for _ in range(len(readers)):
         ok, diff, bright = check_motion_from_reader(readers[active])
         print(f"Init VIDEO dev#{DEVICE_INDEXES[active]} moving={ok} diff={diff:.2f}% bright={bright:.2f}%")
-        if ok:
-            break
+        if ok: break
         active = (active + 1) % len(readers)
 
-    # 6) เตรียม Audio I/O และเริ่มจากอุปกรณ์เสียงตาม index mapping
-    audio = AudioIO(aud_handle)
+    # 6) สร้าง audio writer (เริ่มด้วย silence mode) แล้วตั้ง target device ตามภาพ active
+    audio_writer = AudioPipeWriter(aud_handle)
+    audio_writer.start()
     try:
-        audio_dev = AUDIO_DEVICE_INDEXES[active]
+        audio_writer.set_target_device(AUDIO_DEVICE_INDEXES[active])
     except IndexError:
         print("ERROR: AUDIO_DEVICE_INDEXES ไม่ครบ 4 ตัวหรือ index เกินขอบเขต")
         sys.exit(1)
-    audio.start_with_device(audio_dev)
 
     last_switch = time.time()
     out_frame_interval = 1.0 / FPS
-    preview_interval = 1.0 / PREVIEW_FPS
-    last_preview_time = 0.0
-    last_frame = None
+    preview_interval   = 1.0 / PREVIEW_FPS
+    last_preview_time  = 0.0
+    last_frame         = None
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, WIDTH, HEIGHT)
@@ -367,32 +401,27 @@ def main():
             pipe_write(vid_handle, frame.tobytes())
             last_frame = frame
 
-            # ===== AUDIO → เขียนลงท่อ =====
-            audio.write_once()
-
             # ===== PREVIEW =====
             if (t0 - last_preview_time) >= preview_interval:
                 frames = [ensure_size(r.get_latest(), WIDTH, HEIGHT) for r in readers]
                 grid = make_preview_grid(frames, active)
                 cv2.imshow(WINDOW_NAME, grid)
                 k = cv2.waitKey(1) & 0xFF
-                if k == 27:  # ESC เพื่อออก
+                if k == 27:  # ESC
                     break
                 elif k in (ord('1'), ord('2'), ord('3'), ord('4')):
                     new_active = int(chr(k)) - 1
                     if new_active != active:
-                        # สลับเสียงไปยังอุปกรณ์ที่จับคู่กับภาพใหม่
+                        # สลับอุปกรณ์เสียงให้ตรงกับภาพใหม่ (audio_writer จะ crossfade เอง)
                         try:
-                            new_dev = AUDIO_DEVICE_INDEXES[new_active]
+                            audio_writer.set_target_device(AUDIO_DEVICE_INDEXES[new_active])
                         except IndexError:
                             print("AUDIO_DEVICE_INDEXES ไม่ครบ 4 ตัว")
-                            new_dev = AUDIO_DEVICE_INDEXES[active]
-                        audio.crossfade_to_device(new_dev)
                         active = new_active
                         last_switch = time.time()
                 last_preview_time = t0
 
-            # ===== AUTO SWITCH ทุก SWITCH_SECONDS (ตรวจ motion ก่อน) =====
+            # ===== AUTO SWITCH (ทุก SWITCH_SECONDS + ตรวจ motion ก่อน) =====
             if time.time() - last_switch >= SWITCH_SECONDS:
                 probe = active
                 switched = False
@@ -402,21 +431,19 @@ def main():
                     print(f"Pre-switch VIDEO dev#{DEVICE_INDEXES[probe]} moving={ok} diff={diff:.2f}% bright={bright:.2f}%")
                     if ok:
                         try:
-                            new_dev = AUDIO_DEVICE_INDEXES[probe]
+                            audio_writer.set_target_device(AUDIO_DEVICE_INDEXES[probe])
                         except IndexError:
                             print("AUDIO_DEVICE_INDEXES ไม่ครบ 4 ตัว — คงเสียงเดิม")
-                            new_dev = AUDIO_DEVICE_INDEXES[active]
-                        audio.crossfade_to_device(new_dev)
                         active = probe
                         last_switch = time.time()
-                        print(f"Switched → VIDEO dev#{DEVICE_INDEXES[active]} + AUDIO dev#{new_dev}")
+                        print(f"Switched → VIDEO dev#{DEVICE_INDEXES[active]} + AUDIO dev#{AUDIO_DEVICE_INDEXES[active]}")
                         switched = True
                         break
                 if not switched:
                     print("All candidates look frozen/dark. Keep current.")
                     last_switch = time.time()
 
-            # pace
+            # pace video
             elapsed = time.time() - t0
             sleep_dur = out_frame_interval - elapsed
             if sleep_dur > 0:
@@ -424,22 +451,16 @@ def main():
 
     finally:
         # cleanup
+        try: audio_writer.stop()
+        except Exception: pass
         try:
             win32file.CloseHandle(vid_handle)
             win32file.CloseHandle(aud_handle)
-        except Exception:
-            pass
-        for r in readers:
-            r.close()
-        try:
-            audio.stop()
-        except Exception:
-            pass
+        except Exception: pass
+        for r in readers: r.close()
         cv2.destroyAllWindows()
-        try:
-            ff.terminate()
-        except Exception:
-            pass
+        try: ff.terminate()
+        except Exception: pass
 
 
 if __name__ == "__main__":
